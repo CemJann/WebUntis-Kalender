@@ -1,139 +1,164 @@
 """
-WebUntis → Apple Calendar Sync
-Dieses Skript liest deinen Stundenplan aus WebUntis und erstellt eine .ics-Datei,
-die Apple Calendar automatisch abonnieren kann.
+WebUntis -> Apple Calendar Sync
+Nutzt die WebUntis JSON-RPC API direkt (keine externe Bibliothek noetig).
 """
 
-import webuntis
-import webuntis.session
-from icalendar import Calendar, Event, vText
-from datetime import datetime, timedelta, date
-import pytz
+import requests
+import json
 import os
 import hashlib
+import pytz
+from datetime import datetime, date, timedelta
+from icalendar import Calendar, Event
 
-# ─────────────────────────────────────────────
-# KONFIGURATION (wird aus GitHub Secrets geladen)
-# ─────────────────────────────────────────────
-SERVER   = os.environ["WEBUNTIS_SERVER"]    # z.B. "borys.webuntis.com"
-SCHULE   = os.environ["WEBUNTIS_SCHOOL"]    # z.B. "Meine-Schule"
-USERNAME = os.environ["WEBUNTIS_USERNAME"]  # dein WebUntis-Benutzername
-PASSWORD = os.environ["WEBUNTIS_PASSWORD"]  # dein WebUntis-Passwort
+SERVER   = os.environ["WEBUNTIS_SERVER"]
+SCHOOL   = os.environ["WEBUNTIS_SCHOOL"]
+USERNAME = os.environ["WEBUNTIS_USERNAME"]
+PASSWORD = os.environ["WEBUNTIS_PASSWORD"]
 TIMEZONE = "Europe/Berlin"
-
-# Wie viele Wochen in die Zukunft soll der Kalender gehen?
 WOCHEN_VORAUS = 8
 
 
-def zeit_zu_datetime(datum: date, zeit_int: int, tz) -> datetime:
-    """Wandelt WebUntis-Zeitformat (z.B. 800 → 08:00) in datetime um."""
+class WebUntisClient:
+    def __init__(self):
+        self.url = f"https://{SERVER}/WebUntis/jsonrpc.do"
+        self.session = requests.Session()
+        self.session_id = None
+        self.person_id = None
+        self.person_type = None
+
+    def _rpc(self, method, params=None):
+        payload = {
+            "id": "1",
+            "method": method,
+            "params": params or {},
+            "jsonrpc": "2.0"
+        }
+        cookies = {"JSESSIONID": self.session_id} if self.session_id else {}
+        r = self.session.post(
+            self.url,
+            params={"school": SCHOOL},
+            json=payload,
+            cookies=cookies,
+            timeout=30
+        )
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            raise Exception(f"WebUntis Fehler: {data['error'].get('message', data['error'])}")
+        return data.get("result")
+
+    def login(self):
+        print("Verbinde mit WebUntis...")
+        result = self._rpc("authenticate", {
+            "user": USERNAME,
+            "password": PASSWORD,
+            "client": "stundenplan-sync"
+        })
+        self.session_id  = result["sessionId"]
+        self.person_id   = result["personId"]
+        self.person_type = result["personType"]
+        print(f"Login erfolgreich (Person-ID: {self.person_id})")
+
+    def logout(self):
+        self._rpc("logout")
+
+    def get_timetable(self, start: date, end: date):
+        print(f"Lade Stundenplan vom {start} bis {end}...")
+        result = self._rpc("getTimetable", {
+            "options": {
+                "startDate": int(start.strftime("%Y%m%d")),
+                "endDate":   int(end.strftime("%Y%m%d")),
+                "element": {
+                    "id":   self.person_id,
+                    "type": self.person_type
+                },
+                "showInfo":      True,
+                "showSubstText": True,
+                "showLsText":    True,
+                "klasseFields":  ["id", "name", "longname"],
+                "roomFields":    ["id", "name", "longname"],
+                "subjectFields": ["id", "name", "longname"],
+                "teacherFields": ["id", "name", "longname"]
+            }
+        })
+        print(f"{len(result)} Eintraege gefunden.")
+        return result
+
+
+def zeit_zu_datetime(datum_int: int, zeit_int: int, tz) -> datetime:
+    datum_str = str(datum_int)
+    jahr  = int(datum_str[0:4])
+    monat = int(datum_str[4:6])
+    tag   = int(datum_str[6:8])
     stunde = zeit_int // 100
     minute = zeit_int % 100
-    dt = datetime(datum.year, datum.month, datum.day, stunde, minute)
-    return tz.localize(dt)
+    return tz.localize(datetime(jahr, monat, tag, stunde, minute))
 
 
-def erstelle_uid(stunde) -> str:
-    """Erstellt eine eindeutige ID für jeden Kalendereintrag."""
-    rohdaten = f"{stunde.date}-{stunde.startTime}-{stunde.endTime}"
-    if stunde.subjects:
-        rohdaten += f"-{stunde.subjects[0].name}"
+def erstelle_uid(stunde: dict) -> str:
+    rohdaten = f"{stunde['date']}-{stunde['startTime']}-{stunde['endTime']}"
+    if stunde.get("su"):
+        rohdaten += f"-{stunde['su'][0].get('name', '')}"
     return hashlib.md5(rohdaten.encode()).hexdigest() + "@webuntis-sync"
 
 
-def hole_stundenplan():
-    """Verbindet sich mit WebUntis und ruft den Stundenplan ab."""
-    print("🔗 Verbinde mit WebUntis...")
-
-    with webuntis.session.Session(
-        username=USERNAME,
-        password=PASSWORD,
-        server=SERVER,
-        school=SCHULE,
-        useKeyring=False,
-    ).login() as session:
-
-        heute = date.today()
-        ende  = heute + timedelta(weeks=WOCHEN_VORAUS)
-
-        print(f"📅 Lade Stundenplan vom {heute} bis {ende}...")
-        stunden = session.timetable(start=heute, end=ende)
-
-        print(f"✅ {len(stunden)} Einträge gefunden.")
-        return stunden
-
-
-def erstelle_kalender(stunden) -> bytes:
-    """Wandelt die WebUntis-Stunden in eine .ics-Datei um."""
+def erstelle_kalender(stunden: list) -> bytes:
     tz  = pytz.timezone(TIMEZONE)
     cal = Calendar()
-
     cal.add("prodid", "-//WebUntis Stundenplan Sync//DE")
     cal.add("version", "2.0")
     cal.add("X-WR-CALNAME", "Stundenplan")
     cal.add("X-WR-TIMEZONE", TIMEZONE)
-    cal.add("REFRESH-INTERVAL;VALUE=DURATION", "PT1H")  # Stündliche Aktualisierung
+    cal.add("REFRESH-INTERVAL;VALUE=DURATION", "PT1H")
     cal.add("X-PUBLISHED-TTL", "PT1H")
 
     for stunde in stunden:
         event = Event()
 
-        # ── Titel ──────────────────────────────────────────
-        if stunde.subjects:
-            fach = stunde.subjects[0].long_name or stunde.subjects[0].name
-        else:
-            fach = "Unbekanntes Fach"
+        fach = "Unbekanntes Fach"
+        if stunde.get("su"):
+            fach = stunde["su"][0].get("longname") or stunde["su"][0].get("name", fach)
 
-        entfall     = getattr(stunde, "code", "") == "cancelled"
-        unregelmäßig = getattr(stunde, "code", "") == "irregular"
-
-        if entfall:
-            titel = f"❌ {fach} – Entfall"
-        elif unregelmäßig:
-            titel = f"⚠️ {fach} (Änderung)"
+        code = stunde.get("code", "")
+        if code == "cancelled":
+            titel = f"Entfall: {fach}"
+        elif code == "irregular":
+            titel = f"Vertretung: {fach}"
         else:
             titel = fach
 
         event.add("summary", titel)
 
-        # ── Zeiten ─────────────────────────────────────────
-        start_dt = zeit_zu_datetime(stunde.date, stunde.startTime, tz)
-        end_dt   = zeit_zu_datetime(stunde.date, stunde.endTime,   tz)
-
+        start_dt = zeit_zu_datetime(stunde["date"], stunde["startTime"], tz)
+        end_dt   = zeit_zu_datetime(stunde["date"], stunde["endTime"],   tz)
         event.add("dtstart", start_dt)
         event.add("dtend",   end_dt)
         event.add("dtstamp", datetime.now(tz=pytz.utc))
 
-        # ── Raum ───────────────────────────────────────────
-        if stunde.rooms:
-            raum = ", ".join(r.name for r in stunde.rooms)
+        if stunde.get("ro"):
+            raum = ", ".join(r.get("name", "") for r in stunde["ro"])
             event.add("location", raum)
 
-        # ── Lehrer ─────────────────────────────────────────
-        beschreibung_teile = []
-        if stunde.teachers:
-            lehrer = ", ".join(t.name for t in stunde.teachers)
-            beschreibung_teile.append(f"Lehrer: {lehrer}")
+        teile = []
+        if stunde.get("te"):
+            lehrer = ", ".join(t.get("longname") or t.get("name", "") for t in stunde["te"])
+            teile.append(f"Lehrer: {lehrer}")
+        if stunde.get("substText"):
+            teile.append(f"Hinweis: {stunde['substText']}")
+        if code == "cancelled":
+            teile.append("Diese Stunde faellt aus!")
+        if teile:
+            event.add("description", "\n".join(teile))
 
-        if entfall:
-            beschreibung_teile.append("⚠️ Diese Stunde fällt aus!")
-        elif unregelmäßig:
-            beschreibung_teile.append("⚠️ Diese Stunde weicht vom regulären Plan ab.")
-
-        if beschreibung_teile:
-            event.add("description", "\n".join(beschreibung_teile))
-
-        # ── Status ─────────────────────────────────────────
-        if entfall:
+        if code == "cancelled":
             event.add("status", "CANCELLED")
             event.add("transp", "TRANSPARENT")
         else:
             event.add("status", "CONFIRMED")
             event.add("transp", "OPAQUE")
 
-        # ── Eindeutige ID ──────────────────────────────────
         event.add("uid", erstelle_uid(stunde))
-
         cal.add_component(event)
 
     return cal.to_ical()
@@ -141,16 +166,20 @@ def erstelle_kalender(stunden) -> bytes:
 
 def main():
     os.makedirs("docs", exist_ok=True)
+    client = WebUntisClient()
+    client.login()
+    try:
+        heute  = date.today()
+        ende   = heute + timedelta(weeks=WOCHEN_VORAUS)
+        stunden = client.get_timetable(heute, ende)
+    finally:
+        client.logout()
 
-    stunden  = hole_stundenplan()
     ics_data = erstelle_kalender(stunden)
-
-    ausgabe_pfad = "docs/stundenplan.ics"
-    with open(ausgabe_pfad, "wb") as f:
+    pfad = "docs/stundenplan.ics"
+    with open(pfad, "wb") as f:
         f.write(ics_data)
-
-    print(f"💾 Kalender gespeichert: {ausgabe_pfad}")
-    print("🎉 Fertig! Der Kalender wurde erfolgreich aktualisiert.")
+    print(f"Kalender gespeichert: {pfad}")
 
 
 if __name__ == "__main__":
