@@ -9,22 +9,19 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-     - name: Repository auschecken
-        uses: actions/checkout@v4
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-      - name: Python einrichten
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python Setup
         uses: actions/setup-python@v5
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           python-version: '3.11'
 
-      - name: Abhaengigkeiten installieren
+      - name: Install
         run: pip install -r requirements.txt
 
-      - name: Stundenplan aktualisieren
+      - name: Run
         env:
           WEBUNTIS_SERVER: ${{ secrets.WEBUNTIS_SERVER }}
           WEBUNTIS_SCHOOL: ${{ secrets.WEBUNTIS_SCHOOL }}
@@ -32,10 +29,10 @@ jobs:
           WEBUNTIS_PASSWORD: ${{ secrets.WEBUNTIS_PASSWORD }}
         run: python stundenplan.py
 
-      - name: Kalender-Datei committen
+      - name: Commit
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/stundenplan.ics docs/.nojekyll
-          git diff --staged --quiet || git commit -m "Stundenplan aktualisiert"
+          git config user.name "bot"
+          git config user.email "bot@github.com"
+          git add docs/
+          git diff --staged --quiet || git commit -m "update"
           git push
