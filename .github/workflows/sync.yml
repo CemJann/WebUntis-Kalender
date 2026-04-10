@@ -9,11 +9,15 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Repository auschecken
+     - name: Repository auschecken
         uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Python einrichten
         uses: actions/setup-python@v5
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           python-version: '3.11'
 
